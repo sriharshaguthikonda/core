@@ -2,6 +2,8 @@
 
 from collections.abc import AsyncIterable
 import logging
+import aiohttp
+import asyncio
 
 from wyoming.asr import Transcribe, Transcript
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
@@ -19,6 +21,36 @@ from .models import DomainDataItem
 
 _LOGGER = logging.getLogger(__name__)
 
+API_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+API_KEY = "your_groq_api_key"  # Replace with your actual Groq API key
+MODEL = "whisper-large-v3"  # Whisper model name
+
+async def _transcribe_with_whisper_on_groq(self, metadata, stream):
+    """Transcribe audio using Whisper on Groq."""
+
+    # Convert async stream to a single audio buffer
+    audio_data = bytearray()
+    async for chunk in stream:
+        audio_data.extend(chunk)
+    
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "audio/wav"
+    }
+
+    data = aiohttp.FormData()
+    data.add_field("file", audio_data, filename="audio.wav", content_type="audio/wav")
+    data.add_field("model", MODEL)
+    data.add_field("language", metadata.language or "en")
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(API_URL, headers=headers, data=data) as response:
+            if response.status == 200:
+                result = await response.json()
+                return stt.SpeechResult(result.get("text"), stt.SpeechResultState.SUCCESS)
+            else:
+                _LOGGER.error("Groq Whisper STT failed with status %d", response.status)
+                return None  # Return None to indicate failure
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -33,9 +65,8 @@ async def async_setup_entry(
         ]
     )
 
-
 class WyomingSttProvider(stt.SpeechToTextEntity):
-    """Wyoming speech-to-text provider."""
+    """Wyoming speech-to-text provider with Whisper on Groq as primary."""
 
     def __init__(
         self,
@@ -88,10 +119,18 @@ class WyomingSttProvider(stt.SpeechToTextEntity):
     async def async_process_audio_stream(
         self, metadata: stt.SpeechMetadata, stream: AsyncIterable[bytes]
     ) -> stt.SpeechResult:
-        """Process an audio stream to STT service."""
+        """Process an audio stream using Whisper on Groq, with Wyoming as a backup."""
+
+        # Try Whisper on Groq first
+        whisper_result = await _transcribe_with_whisper_on_groq(self, metadata, stream)
+        if whisper_result is not None:
+            return whisper_result
+
+        _LOGGER.info("Falling back to Wyoming STT")
+
+        # Fall back to Wyoming STT if Whisper on Groq fails
         try:
             async with AsyncTcpClient(self.service.host, self.service.port) as client:
-                # Set transcription language
                 await client.write_event(Transcribe(language=metadata.language).event())
 
                 # Begin audio stream
@@ -112,7 +151,6 @@ class WyomingSttProvider(stt.SpeechToTextEntity):
                     )
                     await client.write_event(chunk.event())
 
-                # End audio stream
                 await client.write_event(AudioStop().event())
 
                 while True:
@@ -127,7 +165,7 @@ class WyomingSttProvider(stt.SpeechToTextEntity):
                         break
 
         except (OSError, WyomingError):
-            _LOGGER.exception("Error processing audio stream")
+            _LOGGER.exception("Error processing audio stream with Wyoming STT")
             return stt.SpeechResult(None, stt.SpeechResultState.ERROR)
 
         return stt.SpeechResult(
